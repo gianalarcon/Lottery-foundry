@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.13;
+pragma solidity ^0.8.18;
 
 import {VRFCoordinatorV2Interface} from "@chainlink/contracts/src/v0.8/interfaces/VRFCoordinatorV2Interface.sol";
 import {VRFConsumerBaseV2} from "@chainlink/contracts/src/v0.8/VRFConsumerBaseV2.sol";
@@ -13,8 +13,13 @@ import {VRFConsumerBaseV2} from "@chainlink/contracts/src/v0.8/VRFConsumerBaseV2
 
 contract Raffle is VRFConsumerBaseV2 {
     error Raffle__NotEnougthEthSent();
-    error Raffle_TransferFailed();
-    error Raffle_RaffleNotOpen();
+    error Raffle__TransferFailed();
+    error Raffle__RaffleNotOpen();
+    error Raffle__UpkeepNotNeeded(
+        uint256 currentBalance,
+        uint256 numberPlayers,
+        uint256 raffleState
+    );
 
     /* Type declarations */
     enum RaffleState {
@@ -37,13 +42,14 @@ contract Raffle is VRFConsumerBaseV2 {
     uint256 private immutable i_interval;
     address payable[] private s_players;
     uint256 private s_lastTimestamp;
-    address payable s_recentWinner;
+    address payable private s_recentWinner;
     RaffleState private s_raffleState;
 
     /** Events */
 
     event EnteredRaffle(address indexed player);
     event PickedWinner(address indexed player);
+    event RequestedRaffleWinner(uint256 indexed subid);
 
     constructor(
         uint256 _entranceFee,
@@ -68,27 +74,56 @@ contract Raffle is VRFConsumerBaseV2 {
             revert Raffle__NotEnougthEthSent();
         }
         if (s_raffleState != RaffleState.OPEN) {
-            revert Raffle_RaffleNotOpen();
+            revert Raffle__RaffleNotOpen();
         }
         s_players.push(payable(msg.sender));
         emit EnteredRaffle(msg.sender);
     }
 
-    function pickWinner() external {
-        if ((block.timestamp - s_lastTimestamp) < i_interval) revert();
+    // When the winner is supposed to be picked?
+    /**
+     *
+     * @dev This is the function that the Chainlink Automation nodes call
+     * to see if it is time to perform an unkeep. The following should be true
+     * 1. The time interval has passed between raffle runs
+     * 2. The raffle is in the OPEN state
+     * 3. The contract has ETH(aka players)
+     * 4. (Implicit) The subscription is funded with LINK
+     */
+    function checkUpkeep(
+        bytes memory /* checkData */
+    ) public view returns (bool upkeepNeeded, bytes memory /* performData*/) {
+        bool time_passed = (block.timestamp - s_lastTimestamp) >= i_interval;
+        bool is_open = s_raffleState == RaffleState.OPEN;
+        bool has_balance = address(this).balance > 0;
+        bool is_founded = s_players.length > 0;
+        upkeepNeeded = time_passed && is_open && has_balance && is_founded;
+        return (upkeepNeeded, "0x0");
+    }
+
+    function performUpkeep(bytes calldata /* performData*/) external {
+        (bool upkeepNeeded, ) = checkUpkeep("");
+        if (!upkeepNeeded) {
+            revert Raffle__UpkeepNotNeeded(
+                address(this).balance,
+                s_players.length,
+                uint256(s_raffleState)
+            );
+        }
         s_raffleState = RaffleState.CALCULATING;
-        uint256 request_id = i_vrfCoordinator.requestRandomWords(
+        uint256 requestedId = i_vrfCoordinator.requestRandomWords(
             i_gasLane,
             i_subscriptionId,
             REQUEST_CONFIRMATIONS,
             i_callbackGasLimit,
             NUM_WORDS
         );
+        emit RequestedRaffleWinner(requestedId);
     }
 
     // CEI:
     function fulfillRandomWords(
-        uint256 requestId,
+        uint256 /*requestId*/,
         uint256[] memory randomWords
     ) internal override {
         // Checks
@@ -106,7 +141,7 @@ contract Raffle is VRFConsumerBaseV2 {
         // Interactions (Other contratcs)
         (bool success, ) = winner.call{value: address(this).balance}("");
         if (!success) {
-            revert Raffle_TransferFailed();
+            revert Raffle__TransferFailed();
         }
     }
 
@@ -114,5 +149,25 @@ contract Raffle is VRFConsumerBaseV2 {
 
     function getEntranceFee() external view returns (uint256) {
         return i_entranceFee;
+    }
+
+    function getRaffleState() external view returns (RaffleState) {
+        return s_raffleState;
+    }
+
+    function getNumberOfPlayers() public view returns (uint256) {
+        return s_players.length;
+    }
+
+    function getPlayer(uint256 index) public view returns (address) {
+        return s_players[index];
+    }
+
+    function getRecentWinner() public view returns (address) {
+        return s_recentWinner;
+    }
+
+    function getLastTimestamp() public view returns (uint256) {
+        return s_lastTimestamp;
     }
 }
